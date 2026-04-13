@@ -81,9 +81,9 @@
   <div class="status" id="status"></div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js" integrity="sha384-PlRSzpewlarQuj5alIadXwjNUX+2eNMKwr0f07ShWYLy8B6TjEbm7ZlcN/ScSbwy" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js" integrity="sha384-mZT2gIty7ZDdOGkxfP6joZcYdMW1Jvj9dRlfpTmaJAKKXTqzygtB22k7FLe+KZC1" crossorigin="anonymous"></script>
 <script>
 (function() {
   'use strict';
@@ -91,7 +91,6 @@
   const TARGET_W = 528;
   const TARGET_H = 792;
   const API_BASE = 'https://api.are.na/v2';
-  const CORS_PROXY = 'https://corsproxy.io/?';
 
   const urlInput = document.getElementById('url-input');
   const generateBtn = document.getElementById('generate-btn');
@@ -107,7 +106,7 @@
     // Validate it's an are.na link or bare slug
     try {
       const url = new URL(input);
-      if (!url.hostname.endsWith('are.na')) return null;
+      if (url.hostname !== 'are.na' && !url.hostname.endsWith('.are.na')) return null;
       const parts = url.pathname.split('/').filter(Boolean);
       // /user/channel-slug or /user/channel-slug/...
       if (parts.length >= 2) return parts[1];
@@ -163,14 +162,8 @@
   // ── Image Fetching ──
 
   async function fetchImageAsBlob(url) {
-    // Try direct fetch first
     try {
       const res = await fetch(url);
-      if (res.ok) return await res.blob();
-    } catch {}
-    // Try CORS proxy
-    try {
-      const res = await fetch(CORS_PROXY + encodeURIComponent(url));
       if (res.ok) return await res.blob();
     } catch {}
     return null;
@@ -411,8 +404,21 @@
     if (!html) return '<p></p>';
     // Parse as HTML, re-serialize as well-formed XHTML
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    // Remove scripts
-    doc.querySelectorAll('script').forEach(el => el.remove());
+    // Remove dangerous elements
+    doc.querySelectorAll('script,iframe,object,embed,form,svg,math,link,meta,base,style')
+      .forEach(el => el.remove());
+    // Strip event handlers and dangerous attributes from all elements
+    doc.querySelectorAll('*').forEach(el => {
+      for (const attr of [...el.attributes]) {
+        const name = attr.name.toLowerCase();
+        // Remove on* event handlers (onclick, onerror, etc.)
+        if (name.startsWith('on')) { el.removeAttribute(attr.name); continue; }
+        // Remove javascript: URLs in href/src/action/formaction
+        if (['href','src','action','formaction','xlink:href'].includes(name)) {
+          if (/^\s*javascript\s*:/i.test(attr.value)) el.removeAttribute(attr.name);
+        }
+      }
+    });
     // Serialize using XMLSerializer for proper XHTML output
     const serializer = new XMLSerializer();
     const bodyChildren = doc.body.childNodes;
