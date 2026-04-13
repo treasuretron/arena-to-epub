@@ -1,6 +1,11 @@
+# I VIBECODED THIS
+and did not check the code. Yolo. Run at your own risk. Works on my machine. Yes you could have vibe coded it yourself but I figured I'd save you the tokens :)
+
+Claude sez, with some of my edits:
+
 # Are.na to EPUB
 
-A single-page, client-side tool that converts an [Are.na](https://www.are.na) channel into an EPUB file optimized for e-ink readers.
+A single-page, client-side tool that converts an [Are.na](https://www.are.na) channel into an EPUB file optimized for Xteink X3 e-readers.
 
 Paste in a channel URL, hit Generate, and get a downloadable EPUB. No server required (beyond serving the HTML file itself).
 
