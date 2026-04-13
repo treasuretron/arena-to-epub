@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Are.na to EPUB</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 480px;
+    margin: 60px auto;
+    padding: 0 20px;
+    color: #333;
+  }
+  h1 { font-size: 1.4em; margin-bottom: 8px; }
+  p.desc { font-size: 0.85em; color: #777; margin-bottom: 24px; }
+  .input-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  input[type="text"] {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  input[type="text"]:focus { outline: none; border-color: #666; }
+  button {
+    padding: 10px 20px;
+    background: #333;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { background: #555; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  .progress-area { margin-top: 8px; }
+  .progress-bar-outer {
+    width: 100%;
+    height: 6px;
+    background: #eee;
+    border-radius: 3px;
+    overflow: hidden;
+    display: none;
+  }
+  .progress-bar-inner {
+    height: 100%;
+    width: 0%;
+    background: #333;
+    transition: width 0.2s;
+  }
+  .status {
+    font-size: 0.8em;
+    color: #999;
+    margin-top: 6px;
+    min-height: 1.2em;
+  }
+  .error { color: #c33; }
+</style>
+</head>
+<body>
+
+<h1>Are.na &rarr; EPUB</h1>
+<p class="desc">Paste an Are.na channel link. Images are dithered for e-ink.</p>
+
+<div class="input-row">
+  <input type="text" id="url-input" placeholder="https://www.are.na/user/channel-name">
+  <button id="generate-btn">Generate</button>
+</div>
+
+<div class="progress-area">
+  <div class="progress-bar-outer" id="progress-bar">
+    <div class="progress-bar-inner" id="progress-fill"></div>
+  </div>
+  <div class="status" id="status"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script>
+(function() {
+  'use strict';
+
+  const TARGET_W = 528;
+  const TARGET_H = 792;
+  const API_BASE = 'https://api.are.na/v2';
+  const CORS_PROXY = 'https://corsproxy.io/?';
+
+  const urlInput = document.getElementById('url-input');
+  const generateBtn = document.getElementById('generate-btn');
+  const progressBar = document.getElementById('progress-bar');
+  const progressFill = document.getElementById('progress-fill');
+  const statusEl = document.getElementById('status');
+
+  // ── URL Parsing ──
+
+  function parseSlug(input) {
+    input = input.trim();
+    if (!input) return null;
+    // Validate it's an are.na link or bare slug
+    try {
+      const url = new URL(input);
+      if (!url.hostname.endsWith('are.na')) return null;
+      const parts = url.pathname.split('/').filter(Boolean);
+      // /user/channel-slug or /user/channel-slug/...
+      if (parts.length >= 2) return parts[1];
+      if (parts.length === 1) return parts[0];
+      return null;
+    } catch {
+      // Might be a bare slug
+      if (/^[a-z0-9][a-z0-9-]*$/i.test(input)) return input;
+      return null;
+    }
+  }
+
+  // ── Status / Progress ──
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('error', !!isError);
+  }
+
+  function setProgress(pct) {
+    progressBar.style.display = 'block';
+    progressFill.style.width = Math.min(100, Math.max(0, pct)) + '%';
+  }
+
+  // ── API Fetching ──
+
+  async function fetchJson(url) {
+    const res = await fetch(url);
+    if (res.status === 404) throw new Error('Channel not found or is private.');
+    if (res.status === 429) throw new Error('Rate limited. Try again in a minute.');
+    if (!res.ok) throw new Error(`API error: ${res.status}`);
+    return res.json();
+  }
+
+  async function fetchChannel(slug) {
+    return fetchJson(`${API_BASE}/channels/${slug}`);
+  }
+
+  async function fetchAllBlocks(slug) {
+    const blocks = [];
+    let page = 1;
+    while (true) {
+      setStatus(`Fetching blocks (page ${page})...`);
+      const data = await fetchJson(`${API_BASE}/channels/${slug}/contents?per=100&page=${page}`);
+      const contents = data.contents || [];
+      blocks.push(...contents);
+      if (contents.length < 100) break;
+      page++;
+    }
+    return blocks;
+  }
+
+  // ── Image Fetching ──
+
+  async function fetchImageAsBlob(url) {
+    // Try direct fetch first
+    try {
+      const res = await fetch(url);
+      if (res.ok) return await res.blob();
+    } catch {}
+    // Try CORS proxy
+    try {
+      const res = await fetch(CORS_PROXY + encodeURIComponent(url));
+      if (res.ok) return await res.blob();
+    } catch {}
+    return null;
+  }
+
+  function blobToImage(blob) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(img.src); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(img.src); reject(new Error('Image load failed')); };
+      img.src = URL.createObjectURL(blob);
+    });
+  }
+
+  // ── Image Processing ──
+
+  function shouldRotate(w, h) {
+    // Compare rendered area: portrait vs rotated 90 degrees
+    const areaPortrait = Math.min(TARGET_W / w, TARGET_H / h, 1) * w * h;
+    const areaRotated  = Math.min(TARGET_W / h, TARGET_H / w, 1) * w * h;
+    return areaRotated > areaPortrait;
+  }
+
+  function resizeAndRotate(img) {
+    let w = img.naturalWidth || img.width;
+    let h = img.naturalHeight || img.height;
+    const rotate = shouldRotate(w, h);
+
+    if (rotate) { [w, h] = [h, w]; }
+
+    const scale = Math.min(TARGET_W / w, TARGET_H / h, 1);
+    const dw = Math.round(w * scale);
+    const dh = Math.round(h * scale);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = dw;
+    canvas.height = dh;
+    const ctx = canvas.getContext('2d');
+
+    if (rotate) {
+      ctx.translate(dw, 0);
+      ctx.rotate(Math.PI / 2);
+      ctx.drawImage(img, 0, 0, dh, dw);
+    } else {
+      ctx.drawImage(img, 0, 0, dw, dh);
+    }
+    return canvas;
+  }
+
+  function toGrayscale(imageData) {
+    const d = imageData.data;
+    const gray = new Float32Array(imageData.width * imageData.height);
+    for (let i = 0; i < gray.length; i++) {
+      const j = i * 4;
+      gray[i] = 0.299 * d[j] + 0.587 * d[j+1] + 0.114 * d[j+2];
+    }
+    return gray;
+  }
+
+  function atkinsonDither(pixels, width, height, thresh) {
+    thresh = thresh || 128;
+    const out = new Uint8Array(width * height);
+    const err = new Float32Array(pixels);
+    const offsets = [[1,0],[2,0],[-1,1],[0,1],[1,1],[0,2]];
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const oldVal = err[idx];
+        const newVal = oldVal >= thresh ? 255 : 0;
+        out[idx] = newVal;
+        const quantErr = (oldVal - newVal) / 8;
+        for (let k = 0; k < 6; k++) {
+          const nx = x + offsets[k][0];
+          const ny = y + offsets[k][1];
+          if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            err[ny * width + nx] += quantErr;
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  function applyDitherToCanvas(canvas) {
+    const ctx = canvas.getContext('2d');
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const gray = toGrayscale(imageData);
+    const dithered = atkinsonDither(gray, canvas.width, canvas.height);
+    const d = imageData.data;
+    for (let i = 0; i < dithered.length; i++) {
+      const v = dithered[i];
+      const j = i * 4;
+      d[j] = d[j+1] = d[j+2] = v;
+      d[j+3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  function canvasToBlob(canvas) {
+    return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  }
+
+  // ── QR Code ──
+
+  function generateQRCanvas(text, size) {
+    const qr = qrcode(0, 'L');
+    qr.addData(text);
+    qr.make();
+    const moduleCount = qr.getModuleCount();
+    const cellSize = Math.max(1, Math.floor(size / moduleCount)) * 2;
+    const actualSize = cellSize * moduleCount;
+    const canvas = document.createElement('canvas');
+    canvas.width = actualSize;
+    canvas.height = actualSize;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, actualSize, actualSize);
+    ctx.fillStyle = '#000';
+    for (let r = 0; r < moduleCount; r++) {
+      for (let c = 0; c < moduleCount; c++) {
+        if (qr.isDark(r, c)) {
+          ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+        }
+      }
+    }
+    return canvas;
+  }
+
+  // ── Text Wrapping on Canvas ──
+
+  function wrapText(ctx, text, maxWidth, fontSize) {
+    ctx.font = `${fontSize}px sans-serif`;
+    const words = text.split(/\s+/);
+    const lines = [];
+    let line = '';
+    for (const word of words) {
+      const test = line ? line + ' ' + word : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+
+  // ── Composite Page (Link / Media blocks) ──
+
+  async function buildCompositePage(imageUrl, title, linkUrl) {
+    const canvas = document.createElement('canvas');
+    canvas.width = TARGET_W;
+    canvas.height = TARGET_H;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, TARGET_W, TARGET_H);
+
+    const padding = 16;
+    const qrBaseSize = 120;
+    const titleFontSize = 18;
+    let yOffset = padding;
+
+    // Generate QR first so we know its actual size
+    let qrCanvas = null;
+    if (linkUrl) {
+      try { qrCanvas = generateQRCanvas(linkUrl, qrBaseSize); } catch {}
+    }
+    const qrH = qrCanvas ? qrCanvas.height : 0;
+
+    // Measure title
+    ctx.fillStyle = '#000';
+    const titleText = title || '';
+    const titleLines = titleText ? wrapText(ctx, titleText, TARGET_W - padding * 2, titleFontSize) : [];
+    const titleHeight = titleLines.length * (titleFontSize + 4) + (titleLines.length ? 8 : 0);
+
+    // Calculate image area: total height minus title, QR, and padding
+    const imageMaxH = TARGET_H - titleHeight - qrH - padding * 4;
+
+    // Draw preview image
+    if (imageUrl) {
+      try {
+        const blob = await fetchImageAsBlob(imageUrl);
+        if (blob) {
+          const img = await blobToImage(blob);
+          const iw = img.naturalWidth || img.width;
+          const ih = img.naturalHeight || img.height;
+          const scale = Math.min((TARGET_W - padding * 2) / iw, imageMaxH / ih, 1);
+          const dw = Math.round(iw * scale);
+          const dh = Math.round(ih * scale);
+          const dx = Math.round((TARGET_W - dw) / 2);
+          ctx.drawImage(img, dx, yOffset, dw, dh);
+          yOffset += dh + 12;
+        }
+      } catch {}
+    }
+
+    // Draw title text
+    if (titleLines.length) {
+      ctx.fillStyle = '#000';
+      ctx.font = `${titleFontSize}px sans-serif`;
+      ctx.textAlign = 'center';
+      for (const line of titleLines) {
+        yOffset += titleFontSize + 4;
+        ctx.fillText(line, TARGET_W / 2, yOffset);
+      }
+      yOffset += 8;
+      ctx.textAlign = 'start';
+    }
+
+    // Draw QR code at bottom center
+    if (qrCanvas) {
+      const qx = Math.round((TARGET_W - qrCanvas.width) / 2);
+      const qy = TARGET_H - qrCanvas.height - padding;
+      ctx.drawImage(qrCanvas, qx, qy);
+    }
+
+    // Dither the whole composite
+    applyDitherToCanvas(canvas);
+    return canvasToBlob(canvas);
+  }
+
+  // ── Process a single image block ──
+
+  async function processImageBlock(imageUrl) {
+    const blob = await fetchImageAsBlob(imageUrl);
+    if (!blob) return null;
+    const img = await blobToImage(blob);
+    const canvas = resizeAndRotate(img);
+    applyDitherToCanvas(canvas);
+    return canvasToBlob(canvas);
+  }
+
+  // ── XHTML Sanitization ──
+
+  function sanitizeXhtml(html) {
+    if (!html) return '<p></p>';
+    // Parse as HTML, re-serialize as well-formed XHTML
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    // Remove scripts
+    doc.querySelectorAll('script').forEach(el => el.remove());
+    // Serialize using XMLSerializer for proper XHTML output
+    const serializer = new XMLSerializer();
+    const bodyChildren = doc.body.childNodes;
+    let out = '';
+    for (let i = 0; i < bodyChildren.length; i++) {
+      out += serializer.serializeToString(bodyChildren[i]);
+    }
+    // Strip any xmlns="..." attributes XMLSerializer adds to every element
+    out = out.replace(/ xmlns="http:\/\/www\.w3\.org\/1999\/xhtml"/g, '');
+    // Replace &nbsp; with &#160; (XHTML doesn't define &nbsp;)
+    out = out.replace(/&nbsp;/g, '&#160;');
+    return out || '<p></p>';
+  }
+
+  // ── EPUB Building ──
+
+  function xmlEscape(s) {
+    return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  async function buildEpub(channelTitle, processedBlocks) {
+    const zip = new JSZip();
+    const uid = 'arena-epub-' + Date.now();
+
+    // mimetype must be first, STORE not deflate
+    zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+
+    // container.xml
+    zip.file('META-INF/container.xml',
+`<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`);
+
+    // Build manifest and spine entries
+    let manifestItems = '';
+    let spineItems = '';
+    let navPoints = '';
+
+    for (let i = 0; i < processedBlocks.length; i++) {
+      const b = processedBlocks[i];
+      const id = `block${String(i+1).padStart(3,'0')}`;
+      const chapterFile = `chapters/${id}.xhtml`;
+      const title = xmlEscape(b.title || `Block ${i+1}`);
+
+      manifestItems += `    <item id="${id}" href="${chapterFile}" media-type="application/xhtml+xml"/>\n`;
+      spineItems += `    <itemref idref="${id}"/>\n`;
+      navPoints += `    <navPoint id="nav-${id}" playOrder="${i+1}"><navLabel><text>${title}</text></navLabel><content src="${chapterFile}"/></navPoint>\n`;
+
+      if (b.type === 'image' && b.imageBlob) {
+        const imgFile = `images/${id}.png`;
+        manifestItems += `    <item id="${id}-img" href="${imgFile}" media-type="image/png"/>\n`;
+        zip.file(`OEBPS/${imgFile}`, b.imageBlob);
+
+        zip.file(`OEBPS/${chapterFile}`,
+`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>${title}</title>
+<style>body{margin:0;padding:0;text-align:center}img{max-width:100%;max-height:100%}</style>
+</head>
+<body><div style="text-align:center"><img src="../images/${id}.png" alt="${title}"/></div></body>
+</html>`);
+      } else if (b.type === 'text') {
+        zip.file(`OEBPS/${chapterFile}`,
+`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>${title}</title>
+<style>body{margin:1em;font-family:serif;line-height:1.5}</style>
+</head>
+<body>${b.html}</body>
+</html>`);
+      }
+    }
+
+    // content.opf
+    zip.file('OEBPS/content.opf',
+`<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${xmlEscape(channelTitle)}</dc:title>
+    <dc:identifier id="uid">${uid}</dc:identifier>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+${manifestItems}  </manifest>
+  <spine toc="ncx">
+${spineItems}  </spine>
+</package>`);
+
+    // toc.ncx
+    zip.file('OEBPS/toc.ncx',
+`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="${uid}"/>
+    <meta name="dtb:depth" content="1"/>
+    <meta name="dtb:totalPageCount" content="0"/>
+    <meta name="dtb:maxPageNumber" content="0"/>
+  </head>
+  <docTitle><text>${xmlEscape(channelTitle)}</text></docTitle>
+  <navMap>
+${navPoints}  </navMap>
+</ncx>`);
+
+    setStatus('Packaging EPUB...');
+    return zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip' });
+  }
+
+  // ── Main Flow ──
+
+  async function generate() {
+    const slug = parseSlug(urlInput.value);
+    if (!slug) {
+      setStatus('Please enter a valid Are.na channel link.', true);
+      return;
+    }
+
+    generateBtn.disabled = true;
+    setProgress(0);
+    let skipped = 0;
+
+    try {
+      setStatus('Fetching channel info...');
+      const channel = await fetchChannel(slug);
+      const channelTitle = channel.title || slug;
+
+      const blocks = await fetchAllBlocks(slug);
+      if (!blocks.length) {
+        setStatus('Channel is empty.', true);
+        generateBtn.disabled = false;
+        return;
+      }
+
+      // Filter blocks
+      const supported = blocks.filter(b =>
+        b.class === 'Image' || b.class === 'Text' ||
+        b.class === 'Link' || b.class === 'Media'
+      );
+
+      if (!supported.length) {
+        setStatus('No supported blocks found in this channel.', true);
+        generateBtn.disabled = false;
+        return;
+      }
+
+      const processedBlocks = [];
+
+      for (let i = 0; i < supported.length; i++) {
+        const block = supported[i];
+        const pct = ((i + 1) / supported.length) * 90;
+        setProgress(pct);
+        setStatus(`Processing block ${i+1} of ${supported.length}...`);
+
+        const blockTitle = block.title || block.generated_title || '';
+
+        if (block.class === 'Image') {
+          const imgUrl = block.image && (block.image.display && block.image.display.url || block.image.original && block.image.original.url);
+          if (!imgUrl) { skipped++; continue; }
+          try {
+            const blob = await processImageBlock(imgUrl);
+            if (blob) {
+              processedBlocks.push({ type: 'image', title: blockTitle || `Image ${i+1}`, imageBlob: blob });
+            } else { skipped++; }
+          } catch { skipped++; }
+
+        } else if (block.class === 'Text') {
+          const html = sanitizeXhtml(block.content_html || block.content || '');
+          processedBlocks.push({ type: 'text', title: blockTitle || `Text ${i+1}`, html });
+
+        } else if (block.class === 'Link') {
+          const imgUrl = block.image && block.image.display && block.image.display.url;
+          const linkUrl = (block.source && block.source.url) || '';
+          try {
+            const blob = await buildCompositePage(imgUrl, blockTitle, linkUrl);
+            if (blob) {
+              processedBlocks.push({ type: 'image', title: blockTitle || `Link ${i+1}`, imageBlob: blob });
+            } else { skipped++; }
+          } catch { skipped++; }
+
+        } else if (block.class === 'Media') {
+          const imgUrl = block.image && block.image.display && block.image.display.url;
+          const mediaUrl = (block.source && block.source.url) || '';
+          try {
+            const blob = await buildCompositePage(imgUrl, blockTitle, mediaUrl);
+            if (blob) {
+              processedBlocks.push({ type: 'image', title: blockTitle || `Media ${i+1}`, imageBlob: blob });
+            } else { skipped++; }
+          } catch { skipped++; }
+        }
+      }
+
+      if (!processedBlocks.length) {
+        setStatus('All blocks were skipped (likely CORS issues). Try a different channel.', true);
+        generateBtn.disabled = false;
+        return;
+      }
+
+      setProgress(95);
+      const epubBlob = await buildEpub(channelTitle, processedBlocks);
+      setProgress(100);
+
+      const filename = channelTitle.replace(/[^a-z0-9]+/gi, '-').toLowerCase() + '.epub';
+      saveAs(epubBlob, filename);
+
+      const sizeMB = (epubBlob.size / 1024 / 1024).toFixed(1);
+      let msg = `Done! ${filename} (${sizeMB} MB), ${processedBlocks.length} blocks.`;
+      if (skipped) msg += ` ${skipped} block(s) skipped.`;
+      setStatus(msg);
+
+    } catch (err) {
+      setStatus(err.message || 'Something went wrong.', true);
+    } finally {
+      generateBtn.disabled = false;
+    }
+  }
+
+  generateBtn.addEventListener('click', generate);
+  urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') generate(); });
+})();
+</script>
+</body>
+</html>
